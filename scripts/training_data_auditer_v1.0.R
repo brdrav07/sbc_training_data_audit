@@ -151,7 +151,7 @@ add_gda_coords <- function(df, x_col = "x_3577", y_col = "y_3577") {
 poi <- add_gda_coords(poi)
 
 # Ensure poi is in the same CRS as the vector data
-poi_sf <- st_as_sf(poi, coords = c("x_gda94", "y_gda94"), crs = 4283)  ### MAY HAVE TO SWAP TO 3577 
+poi_sf <- st_as_sf(poi, coords = c("x_gda94", "y_gda94"), crs = 3577)  ### MAY HAVE TO SWAP TO 3577 
 
 # Convert to terra vect for efficient extraction
 poi_vect <- vect(poi_sf)
@@ -215,11 +215,12 @@ for(tif_file in tif_files) {
 rm(tif_file, tif_files)
 gc()
 
+# Save intermediate fire sampled sites
+st.write(poi_sf, file.path(int_dir, "fire_poi.gpkg"), quiet = TRUE, overwrite = TRUE) 
+
 # 2.3.3) Add burn scar flag ....................................................................................................................................
 
-############### CAN IMPORT FIRE SAMPLED POI HERE TO SKIP PROCESSING ###############
-# poi_sf <- st_read("fire_poi.gpkg", quiet = TRUE) # Load pre-sampled fire data
-###################################################################################                     
+
 
 # Extract collection date and RE min fire return interval
 
@@ -230,163 +231,159 @@ gc()
 # Calculate burns after collection and most recent burn
 
 
+################################################################################################################################################################
+################################################################################################################################################################
+################################################################################################################################################################
 
-# Extract fire columns and ensure they are numeric
-fire_columns <- poi_sf %>% 
-  st_drop_geometry() %>%  # Drop the geometry column to avoid issues
-  select(starts_with("FireMonth_")) %>% 
-  mutate(across(everything(), as.numeric))  # Ensure all columns are numeric
+############### CAN IMPORT FIRE SAMPLED POI HERE TO SKIP PROCESSING ###############
+poi_sf <- st_read("intermediates/fire_poi.gpkg", quiet = TRUE) # Load pre-sampled fire data
+###################################################################################   
 
-# Convert fire columns to a numeric matrix
-fire_months_matrix <- as.matrix(fire_columns)
+# Fire columns in ascending order by year
+col_names <- colnames(poi_sf)
+firemonth_cols <- grep("^FireMonth_", col_names, value = TRUE)
+sorted_firemonth_cols <- firemonth_cols[order(as.numeric(sub("FireMonth_", "", firemonth_cols)))]
+reordered_cols <- c(setdiff(col_names, firemonth_cols), sorted_firemonth_cols)
+poi_sf <- poi_sf[, reordered_cols]
 
-# Extract fire years from column names
-fire_years <- as.numeric(str_extract(names(fire_columns), "\\d{4}"))
+# Function to process fire metrics
+process_fire_metrics <- function(poi_sf, start_year = 1987) {
+  # Extract fire columns and ensure they are numeric
+  fire_columns <- poi_sf %>%
+    st_drop_geometry() %>%
+    select(starts_with("FireMonth_")) %>%
+    mutate(across(everything(), as.numeric))
+  
+  # Convert fire columns to a numeric matrix
+  fire_months_matrix <- as.matrix(fire_columns)
+  
+  # Extract fire years from column names
+  fire_years <- as.numeric(str_extract(names(fire_columns), "\\d{4}"))
+  
+  # Filter valid fire months (1–12 only)
+  valid_fire_mask <- fire_months_matrix >= 1 & fire_months_matrix <= 12
+  valid_fire_months <- ifelse(valid_fire_mask, fire_months_matrix, NA)
+  
+  # Find the most recent burn
+  most_recent_burn <- apply(valid_fire_months, 1, function(row) {
+    # Find the first non-NA value from the right (most recent column)
+    for (i in length(row):1) {
+      if (!is.na(row[i])) {
+        year <- fire_years[i]
+        month <- row[i]
+        return(as.Date(sprintf("%04d-%02d-01", year, month)))  # Return as Date object
+      }
+    }
+    return(NA)  # Return NA if no valid burns are found
+  })
+  
+  # Explicitly convert the result to a Date vector
+  most_recent_burn <- as.Date(most_recent_burn, origin = "1970-01-01")
+  
+  # Calculate metrics
+  fire_indices <- (fire_years - start_year) * 12 + valid_fire_months
+  fire_intervals <- apply(fire_indices, 1, function(x) {
+    valid_indices <- na.omit(x)
+    if (length(valid_indices) > 1) diff(sort(valid_indices)) else NA
+  })
+  
+  fire_return_interval <- sapply(fire_intervals, function(x) {
+    if (is.null(x) || all(is.na(x))) {
+      NA  # Return NA if x is NULL or all values are NA
+    } else {
+      mean(x, na.rm = TRUE)  # Calculate the mean if x has valid values
+    }
+  })
+  
+  collection_date <- dmy(poi_sf$COLLECTION_DATE)
+  collection_index <- (year(collection_date) - start_year) * 12 + month(collection_date)
+  
+  burns_after_collection <- rowSums(fire_indices > collection_index, na.rm = TRUE)
+  
+  # Add metrics to poi_sf
+  poi_sf <- poi_sf %>%
+    mutate(
+      num_burns = rowSums(!is.na(valid_fire_months), na.rm = TRUE),
+      fire_intervals = fire_intervals,
+      fire_return_interval = fire_return_interval,
+      collection_date = collection_date,
+      collection_index = collection_index,
+      burns_after_collection = burns_after_collection,
+      most_recent_burn = most_recent_burn,  # Already a Date object
+      recommended_interval = as.numeric(str_extract(FIRE_GUIDELINES, "(?<=INTERVAL_MIN: )\\d+"))
+    )
+  
+  return(poi_sf)
+}
 
-# Filter valid fire months (1–12 only)
-valid_fire_mask <- fire_months_matrix >= 1 & fire_months_matrix <= 12
-valid_fire_months <- ifelse(valid_fire_mask, fire_months_matrix, NA)
-valid_fire_years <- ifelse(valid_fire_mask, 
-                           matrix(rep(fire_years, nrow(fire_months_matrix)), nrow = nrow(fire_months_matrix), byrow = TRUE), 
-                           NA)
-
-# Convert valid fire data to fire indices (months since January 1987)
-fire_indices <- (valid_fire_years - 1987) * 12 + valid_fire_months
-
-# Calculate metrics
-poi_sf <- poi_sf %>%
-  mutate(
-    # Calculate number of burns since Jan 1987
-    num_burns = rowSums(!is.na(valid_fire_months), na.rm = TRUE),
-    
-    # Calculate fire return interval (mean time between burns in months)
-    fire_intervals = apply(fire_indices, 1, function(x) diff(sort(na.omit(x)))),
-    fire_return_interval = sapply(fire_intervals, function(x) ifelse(length(x) > 0, mean(x, na.rm = TRUE), NA)),
-    
-    # Calculate number of burns after the collection date
-    collection_date = dmy(COLLECTION_DATE),
-    collection_index = (year(collection_date) - 1987) * 12 + month(collection_date),
-    burns_after_collection = rowSums(fire_indices > collection_index, na.rm = TRUE),
-    
-    # Find most recent burn
-    most_recent_burn_index = apply(fire_indices, 1, function(x) ifelse(all(is.na(x)), NA, max(x, na.rm = TRUE))),
-    most_recent_burn_year = ifelse(!is.na(most_recent_burn_index), as.numeric(1987 + (most_recent_burn_index %/% 12)), NA),
-    most_recent_burn_month = ifelse(!is.na(most_recent_burn_index), as.numeric(most_recent_burn_index %% 12), NA),
-    most_recent_burn = ifelse(
-      !is.na(most_recent_burn_year) & !is.na(most_recent_burn_month),
-      sprintf("%04d-%02d", as.integer(most_recent_burn_year), as.integer(most_recent_burn_month)),
-      NA
-    ),
-    
-    # Extract the recommended RE fire return interval
-    recommended_interval = as.numeric(str_extract(FIRE_GUIDELINES, "(?<=INTERVAL_MIN: )\\d+"))
+# Function to calculate FD_FLAG and 3-year windows
+calculate_fd_flags <- function(poi_sf, fixed_dates) {
+  collection_date <- dmy(poi_sf$COLLECTION_DATE)
+  time_since_fire <- ifelse(
+    !is.na(poi_sf$most_recent_burn),
+    (year(collection_date) - year(poi_sf$most_recent_burn)) * 12 + 
+      (month(collection_date) - month(poi_sf$most_recent_burn)),
+    NA
   )
+  
+  fire_after_collection <- !is.na(poi_sf$most_recent_burn) & poi_sf$most_recent_burn > collection_date
+  
+  time_to_fixed_dates <- sapply(fixed_dates, function(fixed_date) {
+    ifelse(
+      !is.na(poi_sf$most_recent_burn),
+      (year(fixed_date) - year(poi_sf$most_recent_burn)) * 12 + 
+        (month(fixed_date) - month(poi_sf$most_recent_burn)),
+      NA
+    )
+  })
+  
+  recommended_interval_months <- poi_sf$recommended_interval * 12
+  
+  FD_FLAG <- ifelse(
+    fire_after_collection & rowSums(time_to_fixed_dates > recommended_interval_months, na.rm = TRUE) == length(fixed_dates),
+    "Recovered",
+    ifelse(
+      fire_after_collection & rowSums(time_to_fixed_dates <= recommended_interval_months, na.rm = TRUE) > 0,
+      "Recovering",
+      "Unburnt"
+    )
+  )
+  
+  fixed_years <- c(2017, 2019, 2021, 2023)
+  FD_3Y <- sapply(fixed_years, function(year) {
+    window_start <- as.Date(paste0(year - 3, "-01-01"))
+    window_end <- as.Date(paste0(year, "-01-01"))
+    ifelse(
+      !is.na(poi_sf$most_recent_burn) & 
+        poi_sf$most_recent_burn >= window_start & 
+        poi_sf$most_recent_burn < window_end,
+      "Burnt in three years prior to era",
+      "Unburnt in three years prior to era"
+    )
+  })
+  
+  poi_sf <- poi_sf %>%
+    mutate(
+      time_since_fire = time_since_fire,
+      FD_FLAG = FD_FLAG,
+      FD_2017_3Y = FD_3Y[, 1],
+      FD_2019_3Y = FD_3Y[, 2],
+      FD_2021_3Y = FD_3Y[, 3],
+      FD_2023_3Y = FD_3Y[, 4]
+    )
+  
+  return(poi_sf)
+}
 
-# Convert list column to json string
-poi_sf$fire_intervals_json <- sapply(poi_sf$fire_intervals, toJSON, auto_unbox = TRUE)
+# Process fire data and calculate metrics
+poi_sf <- process_fire_metrics(poi_sf)
 
-# Drop intermediate variables (optional)
-poi_sf <- poi_sf %>%
-  select(-fire_intervals)
+# Calculate FD_FLAG and 3-year windows
+fixed_dates <- as.Date(c("2017-01-01", "2019-01-01", "2021-01-01", "2023-01-01"))
+poi_sf <- calculate_fd_flags(poi_sf, fixed_dates)
 
 # # clean up intermediates
-# rm(fire_columns, fire_indices, fire_months_matrix, valid_fire_mask, valid_fire_months, valid_fire_years)
-
-
-
-
-######### PAST METHOD = extract fire scars for 3 years prior to each era
-######### CREATE FD_FLAG
-# Define the fixed dates for comparison
-fixed_dates <- as.Date(c("2017-01-01", "2019-01-01", "2021-01-01", "2023-01-01"))
-
-# Extract fire columns and ensure they are numeric
-fire_columns <- poi_sf %>% 
-  st_drop_geometry() %>%  # Drop the geometry column to avoid issues
-  select(starts_with("FireMonth_")) %>% 
-  mutate(across(everything(), as.numeric))  # Ensure all columns are numeric
-
-# Convert fire columns to a numeric matrix
-fire_months_matrix <- as.matrix(fire_columns)
-
-# Extract fire years from column names
-fire_years <- as.numeric(str_extract(names(fire_columns), "\\d{4}"))
-
-# Filter valid fire months (1–12 only)
-valid_fire_mask <- fire_months_matrix >= 1 & fire_months_matrix <= 12
-valid_fire_months <- ifelse(valid_fire_mask, fire_months_matrix, NA)
-valid_fire_years <- ifelse(valid_fire_mask, 
-                           matrix(rep(fire_years, nrow(fire_months_matrix)), nrow = nrow(fire_months_matrix), byrow = TRUE), 
-                           NA)
-
-# Convert valid fire data to fire indices (months since January 1987)
-fire_indices <- (valid_fire_years - 1987) * 12 + valid_fire_months
-
-# Identify the most recent burn
-most_recent_burn_index <- apply(fire_indices, 1, max, na.rm = TRUE)
-most_recent_burn_year <- 1987 + (most_recent_burn_index %/% 12)
-most_recent_burn_month <- most_recent_burn_index %% 12
-most_recent_burn <- ifelse(!is.na(most_recent_burn_year) & !is.na(most_recent_burn_month),
-                           as.Date(sprintf("%04d-%02d-01", most_recent_burn_year, most_recent_burn_month)),
-                           NA)
-
-# Parse the collection date
-collection_date <- dmy(poi_sf$COLLECTION_DATE)
-collection_index <- (year(collection_date) - 1987) * 12 + month(collection_date)
-
-# Calculate time differences
-time_since_fire <- ifelse(!is.na(most_recent_burn),
-                          (year(collection_date) - year(most_recent_burn)) * 12 + (month(collection_date) - month(most_recent_burn)),
-                          NA)
-
-fire_after_collection <- !is.na(most_recent_burn) & most_recent_burn > collection_date
-
-time_to_fixed_dates <- sapply(fixed_dates, function(fixed_date) {
-  ifelse(!is.na(most_recent_burn),
-         (year(fixed_date) - year(most_recent_burn)) * 12 + (month(fixed_date) - month(most_recent_burn)),
-         NA)
-})
-
-# Determine FD_FLAG
-recommended_interval_months <- poi_sf$recommended_interval * 12  # Convert years to months
-FD_FLAG <- ifelse(
-  fire_after_collection & rowSums(time_to_fixed_dates > recommended_interval_months, na.rm = TRUE) == length(fixed_dates),
-  "Recovered",
-  ifelse(
-    fire_after_collection & rowSums(time_to_fixed_dates <= recommended_interval_months, na.rm = TRUE) > 0,
-    "Recovering",
-    "Unburnt"
-  )
-)
-
-# Define the fixed years and their corresponding three-year windows
-fixed_years <- c(2017, 2019, 2021, 2023)
-three_year_windows <- lapply(fixed_years, function(year) {
-  list(start = as.Date(paste0(year - 3, "-01-01")), end = as.Date(paste0(year, "-01-01")))
-})
-
-# Check if the most recent burn falls within the three-year window for each era
-FD_3Y <- sapply(three_year_windows, function(window) {
-  ifelse(!is.na(most_recent_burn) & 
-           most_recent_burn >= window$start & 
-           most_recent_burn < window$end,
-         "Burnt in three years prior to era", 
-         "Unburnt in three years prior to era")
-})
-
-# Add results back to poi_sf
-poi_sf <- poi_sf %>%
-  mutate(
-    most_recent_burn = most_recent_burn,
-    time_since_fire = time_since_fire,
-    FD_FLAG = FD_FLAG,
-    FD_2017_3Y = FD_3Y[, 1],
-    FD_2019_3Y = FD_3Y[, 2],
-    FD_2021_3Y = FD_3Y[, 3],
-    FD_2023_3Y = FD_3Y[, 4]
-  )
-
-
+rm(fire_data)
 
 ### 2.4) Age Since Woody Disturbance  ----------------------------------------------------------------------------------
 
