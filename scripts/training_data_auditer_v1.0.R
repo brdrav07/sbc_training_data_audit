@@ -220,21 +220,6 @@ st.write(poi_sf, file.path(int_dir, "fire_poi.gpkg"), quiet = TRUE, overwrite = 
 
 # 2.3.3) Add burn scar flag ....................................................................................................................................
 
-
-
-# Extract collection date and RE min fire return interval
-
-# calculate number of burns since 1987
-
-# calculate fire return interval
-
-# Calculate burns after collection and most recent burn
-
-
-################################################################################################################################################################
-################################################################################################################################################################
-################################################################################################################################################################
-
 ############### CAN IMPORT FIRE SAMPLED POI HERE TO SKIP PROCESSING ###############
 poi_sf <- st_read("intermediates/fire_poi.gpkg", quiet = TRUE) # Load pre-sampled fire data
 ###################################################################################   
@@ -253,17 +238,13 @@ process_fire_metrics <- function(poi_sf, start_year = 1987) {
     st_drop_geometry() %>%
     select(starts_with("FireMonth_")) %>%
     mutate(across(everything(), as.numeric))
-  
   # Convert fire columns to a numeric matrix
   fire_months_matrix <- as.matrix(fire_columns)
-  
   # Extract fire years from column names
   fire_years <- as.numeric(str_extract(names(fire_columns), "\\d{4}"))
-  
   # Filter valid fire months (1–12 only)
   valid_fire_mask <- fire_months_matrix >= 1 & fire_months_matrix <= 12
   valid_fire_months <- ifelse(valid_fire_mask, fire_months_matrix, NA)
-  
   # Find the most recent burn
   most_recent_burn <- apply(valid_fire_months, 1, function(row) {
     # Find the first non-NA value from the right (most recent column)
@@ -276,17 +257,14 @@ process_fire_metrics <- function(poi_sf, start_year = 1987) {
     }
     return(NA)  # Return NA if no valid burns are found
   })
-  
   # Explicitly convert the result to a Date vector
   most_recent_burn <- as.Date(most_recent_burn, origin = "1970-01-01")
-  
   # Calculate metrics
   fire_indices <- (fire_years - start_year) * 12 + valid_fire_months
   fire_intervals <- apply(fire_indices, 1, function(x) {
     valid_indices <- na.omit(x)
     if (length(valid_indices) > 1) diff(sort(valid_indices)) else NA
   })
-  
   fire_return_interval <- sapply(fire_intervals, function(x) {
     if (is.null(x) || all(is.na(x))) {
       NA  # Return NA if x is NULL or all values are NA
@@ -294,12 +272,9 @@ process_fire_metrics <- function(poi_sf, start_year = 1987) {
       mean(x, na.rm = TRUE)  # Calculate the mean if x has valid values
     }
   })
-  
   collection_date <- dmy(poi_sf$COLLECTION_DATE)
   collection_index <- (year(collection_date) - start_year) * 12 + month(collection_date)
-  
   burns_after_collection <- rowSums(fire_indices > collection_index, na.rm = TRUE)
-  
   # Add metrics to poi_sf
   poi_sf <- poi_sf %>%
     mutate(
@@ -312,7 +287,6 @@ process_fire_metrics <- function(poi_sf, start_year = 1987) {
       most_recent_burn = most_recent_burn,  # Already a Date object
       recommended_interval = as.numeric(str_extract(FIRE_GUIDELINES, "(?<=INTERVAL_MIN: )\\d+"))
     )
-  
   return(poi_sf)
 }
 
@@ -325,9 +299,7 @@ calculate_fd_flags <- function(poi_sf, fixed_dates) {
       (month(collection_date) - month(poi_sf$most_recent_burn)),
     NA
   )
-  
   fire_after_collection <- !is.na(poi_sf$most_recent_burn) & poi_sf$most_recent_burn > collection_date
-  
   time_to_fixed_dates <- sapply(fixed_dates, function(fixed_date) {
     ifelse(
       !is.na(poi_sf$most_recent_burn),
@@ -336,9 +308,7 @@ calculate_fd_flags <- function(poi_sf, fixed_dates) {
       NA
     )
   })
-  
   recommended_interval_months <- poi_sf$recommended_interval * 12
-  
   FD_FLAG <- ifelse(
     fire_after_collection & rowSums(time_to_fixed_dates > recommended_interval_months, na.rm = TRUE) == length(fixed_dates),
     "Recovered",
@@ -348,7 +318,6 @@ calculate_fd_flags <- function(poi_sf, fixed_dates) {
       "Unburnt"
     )
   )
-  
   fixed_years <- c(2017, 2019, 2021, 2023)
   FD_3Y <- sapply(fixed_years, function(year) {
     window_start <- as.Date(paste0(year - 3, "-01-01"))
@@ -361,7 +330,6 @@ calculate_fd_flags <- function(poi_sf, fixed_dates) {
       "Unburnt in three years prior to era"
     )
   })
-  
   poi_sf <- poi_sf %>%
     mutate(
       time_since_fire = time_since_fire,
@@ -371,7 +339,6 @@ calculate_fd_flags <- function(poi_sf, fixed_dates) {
       FD_2021_3Y = FD_3Y[, 3],
       FD_2023_3Y = FD_3Y[, 4]
     )
-  
   return(poi_sf)
 }
 
@@ -383,14 +350,13 @@ fixed_dates <- as.Date(c("2017-01-01", "2019-01-01", "2021-01-01", "2023-01-01")
 poi_sf <- calculate_fd_flags(poi_sf, fixed_dates)
 
 # # clean up intermediates
-rm(fire_data)
+rm(col_names, firemonth_cols, fixed_dates, reordered_cols, sorted_firemonth_cols)
 
-### 2.4) Age Since Woody Disturbance  ----------------------------------------------------------------------------------
-
-# 2.4.1) import woody disturbance rasters ====================
+### 2.4) Age Since Woody Disturbance  --------------------------------------------------------------------------------------------------------------------------
+# 2.4.1) Import woody disturbance product  .....................................................................................................................
 slats_disturbance <- terra::rast("spatial_inputs/SLATS_2023/woody_disturbance/DP_QLD_WOODY_AGE_2022_COG.tif") # time since clearing
 
-# 2.4.2) Sample the raster in chunks ====================
+# 2.4.2) Sample the raster in chunks ...........................................................................................................................
 # Initialize result vector
 sampled_values <- rep(NA, nrow(poi_vect))
 
@@ -398,11 +364,8 @@ sampled_values <- rep(NA, nrow(poi_vect))
 for (i in seq_len(n_chunks)) {
   start_idx <- (i - 1) * chunk_size + 1
   end_idx <- min(i * chunk_size, nrow(poi_vect))
-  
   chunk <- poi_vect[start_idx:end_idx]
   sampled_values[start_idx:end_idx] <- terra::extract(slats_disturbance, chunk)[, 2]
-  
-  # Clean up to free memory
   rm(chunk)
   gc()
 }
@@ -420,22 +383,15 @@ poi_sf$WD_TIMING <- NA_character_
 for (i in seq_len(n_chunks)) {
   start_idx <- (i - 1) * chunk_size + 1
   end_idx <- min(i * chunk_size, nrow(poi_sf))
-  
-  # Get current chunk
   chunk <- poi_sf[start_idx:end_idx, ]
-  
-  # Convert dates and extract years
   chunk$COLLECTION_YEAR <- as.numeric(format(
     as.Date(chunk$COLLECTION_DATE, format = "%d/%m/%Y"), 
     "%Y"))
-  
-  # Identify rows to process (sampled_value between 1-30)
+  # Identify rows to process (sampled_value between 1-32)
   process_rows <- which(chunk$ASWD_2022 >= 1 & chunk$ASWD_2022 <= 32)
-  
   if (length(process_rows) > 0) {
     # Calculate WD_YEAR only for valid rows
     chunk$WD_YEAR[process_rows] <- 2022 - chunk$ASWD_2022[process_rows]
-    
     # Determine WD timing for valid rows
     chunk$WD_TIMING[process_rows] <- case_when(
       chunk$WD_YEAR[process_rows] < chunk$COLLECTION_YEAR[process_rows] ~ "Before collection",
